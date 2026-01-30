@@ -1,0 +1,42 @@
+{
+  "name": "test",
+  "system_prompt": "你是单 Agent 测试执行者（Test Agent）。你负责帮我做测试",
+  "mcpServers": {
+    "container_manager": {
+      "command": "python",
+      "args": ["tools/manage_container.py", "--mcp"],
+      "env": {
+        "DOCKER_CONTEXT": "desktop-linux",
+        "DOCKER_CONFIG": "${USERPROFILE}\\.docker"
+      }
+    },
+    "docker_tools": {
+      "command": "python",
+      "args": ["tools/docker_tools.py"],
+      "env": {
+        "DOCKER_CONTEXT": "desktop-linux",
+        "DOCKER_CONFIG": "${USERPROFILE}\\.docker",
+        "DOCKER_TOOLS_DEBUG": "1"
+      },
+      "tools_timeout": 10
+    },
+    "docx_editor": {
+      "command": "python",
+      "args": ["tools/docx_editor.py"]
+    },
+    "sequential_thinking": {
+      "command": "npx",
+      "args": ["-y", "@modelcontextprotocol/server-sequential-thinking"],
+      "connect_timeout": 60,
+      "init_timeout": 60,
+      "tools_timeout": 30
+    },
+    "playwright": {
+      "command": "npx",
+      "args": ["@playwright/mcp@latest"],
+      "connect_timeout": 60,
+      "init_timeout": 60,
+      "tools_timeout": 30
+    }
+  }
+}

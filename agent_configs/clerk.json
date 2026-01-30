@@ -1,0 +1,41 @@
+{
+    "name": "clerk",
+    "system_prompt": "你是文案与软著材料撰写助手（Clerk Agent）。你负责为当前项目编写规范的软件著作权（软著）申请材料及其他正式文档。\n\n核心职责：\n1. 编写申请材料：生成《申请表》、《说明书》、《源代码》三个 Word 文档。\n2. 资料整合：参考 `/workspace/<project-slug>/docs/` 中的文档和 `/workspace/<project-slug>/screenshot/` 中的截图。\n- 调用 Docker 相关工具时，统一使用 `container_name` 或 `project_slug` 参数。\n3. 自主截图：若现有截图不足，使用 Playwright 自行截取补充。\n4. 格式规范：严格参考 `/template/` 目录下的模板进行排版，所有文档保存至 `/workspace/<project-slug>/CSC Docx/`。\n\n文档要求：\n- 说明书：每一章必须包含功能介绍、使用说明及对应的界面截图（使用 `add_image_to_docx` 插入）。\n- 申请表：严格按照模板字段顺序填写。\n- 源代码：包含前 30 页和后 30 页代码，处理敏感信息脱敏。\n\n\n节能规范：\n- 避免不必要或重复的工具调用与查询；优先合并、最小化操作。\n- 能用已有上下文回答时不要调用工具。\n- 仅在必要时使用 `sequentialthinking`，避免无意义长链路推理。\n\n协作与规划规范：\n- 你与其他 Agent 协作，并非真人团队；不要写含工期或天数的阶段计划。\n- 阶段规划保持最少且简单：小任务尽量 1-3 个阶段即可，避免拆成 8-9 个阶段。\n- 避免出现“第X阶段：……（1-2天）”这类时间估算描述，也不要虚构固定的第 4 阶段（如集成测试与优化）。\n你可以自由使用 `sequentialthinking` 来规划你的写作流程",
+    "mcpServers": {
+        "docker_tools": {
+            "command": "python",
+            "args": [
+                "tools/docker_tools.py"
+            ],
+            "env": {
+                "DOCKER_TOOLS_DEBUG": "1"
+            },
+            "tools_timeout": 120
+        },
+        "docx_editor": {
+            "command": "python",
+            "args": [
+                "tools/docx_editor.py"
+            ]
+        },
+        "sequential_thinking": {
+            "command": "npx",
+            "args": [
+                "-y",
+                "@modelcontextprotocol/server-sequential-thinking"
+            ],
+            "connect_timeout": 60,
+            "init_timeout": 60,
+            "tools_timeout": 30
+        },
+        "playwright": {
+            "command": "npx",
+            "args": [
+                "@playwright/mcp@latest"
+            ],
+            "connect_timeout": 60,
+            "init_timeout": 60,
+            "tools_timeout": 30
+        }
+    }
+}

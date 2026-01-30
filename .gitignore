@@ -1,0 +1,18 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+.venv/
+.env
+
+# IDEs
+.vscode/
+.idea/
+.trae/
+
+# Project Specific
+workspace/
+template/
+
+# MCP Logs
+*.log
