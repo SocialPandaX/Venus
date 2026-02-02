@@ -10,12 +10,14 @@
             "env": {
                 "DOCKER_TOOLS_DEBUG": "1"
             },
-            "tools_timeout": 120
+            "tools_timeout": 240
         },
-        "docx_editor": {
-            "command": "python",
+        "office_word": {
+            "command": "uvx",
             "args": [
-                "tools/docx_editor.py"
+                "--from",
+                "office-word-mcp-server",
+                "word_mcp_server"
             ]
         },
         "sequential_thinking": {

@@ -76,28 +76,56 @@ async def _exec_docker(args: List[str], timeout: int = 180) -> str:
             stderr=asyncio.subprocess.STDOUT,
             stdin=asyncio.subprocess.DEVNULL
         )
-        
+
+        output_chunks: List[bytes] = []
+
+        async def _read_stdout() -> None:
+            if process.stdout is None:
+                return
+            while True:
+                chunk = await process.stdout.read(4096)
+                if not chunk:
+                    break
+                output_chunks.append(chunk)
+
+        reader_task = asyncio.create_task(_read_stdout())
+
         try:
-            stdout, _ = await asyncio.wait_for(process.communicate(), timeout=timeout)
+            await asyncio.wait_for(process.wait(), timeout=timeout)
+            await reader_task
             exit_code = process.returncode
             elapsed = time.time() - start
             _debug(f"[docker_tools] exit={exit_code} elapsed={elapsed:.2f}s")
-            
-            output = stdout.decode('utf-8', errors='replace') if stdout else ""
-            
+
+            output = b"".join(output_chunks).decode("utf-8", errors="replace") if output_chunks else ""
+
             if exit_code == 0:
                 return output if output.strip() else f"SUCCESS (Exit Code 0)"
             else:
                 return f"FAILED (Exit Code {exit_code})\nOutput:\n{output}"
-                
+
         except asyncio.TimeoutError:
             try:
                 process.kill()
-            except:
+            except Exception:
                 pass
             _debug(f"[docker_tools] timeout after {timeout}s")
+
+            try:
+                await asyncio.wait_for(process.wait(), timeout=2)
+            except asyncio.TimeoutError:
+                pass
+
+            try:
+                await asyncio.wait_for(reader_task, timeout=2)
+            except asyncio.TimeoutError:
+                reader_task.cancel()
+
+            output = b"".join(output_chunks).decode("utf-8", errors="replace") if output_chunks else ""
+            if output.strip():
+                return f"ERROR: Command timed out after {timeout} seconds.\nOutput:\n{output}"
             return f"ERROR: Command timed out after {timeout} seconds."
-            
+
     except Exception as e:
         _debug(f"[docker_tools] exception: {type(e).__name__}: {e}")
         return f"EXCEPTION: {str(e)}"

@@ -16,7 +16,7 @@ from docx.table import Table, _Cell
 from docx.text.paragraph import Paragraph
 from docx.oxml.table import CT_Tbl
 from docx.oxml.text.paragraph import CT_P
-from docx.oxml.ns import nsdecls
+from docx.oxml.ns import nsdecls, qn
 from docx.oxml import parse_xml
 from mcp.server.fastmcp import FastMCP
 
@@ -25,9 +25,13 @@ mcp = FastMCP("Docx Editor")
 MCP_PROMPT = """
 Docx Editor MCP Server:
 - read_docx / read_docx_advanced: 以高保真度读取 Word 文档内容（支持嵌套表格和页眉页脚）。
-- create_new_docx / add_heading / add_paragraph / add_list_item: 创建并构建带格式的文档。
-- insert_table / set_table_cell_format / merge_table_cells: 专业的表格操作和样式设置。
-- replace_text_global / delete_element / insert_content_relative: 精确编辑已有文档内容。
+- create_new_docx / add_heading / add_paragraph / add_list_item / insert_content_relative:
+  创建并构建带格式的文档，支持字体设置参数：
+  - font_cn: 中文字体（默认 宋体）
+  - font_en: 英文字体（默认 Roma）
+  - bold 默认为 False（不加粗）
+- insert_table / set_table_cell_format / merge_table_cells: 专业的表格操作和样式设置（insert_table、set_table_cell_format 支持 font_cn/font_en/bold）。
+- replace_text_global / delete_element: 精确编辑已有文档内容。
 - get_document_info: 获取文档元数据和统计信息。
 
 **重要规范**：
@@ -44,6 +48,10 @@ Docx Editor MCP Server:
 BASE_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 WORKSPACE_HOST = os.path.join(BASE_DIR, "workspace")
 WORKSPACE_CONTAINER = "/workspace"
+
+# Default fonts when not explicitly specified.
+DEFAULT_FONT_CN = "宋体"
+DEFAULT_FONT_EN = "Roma"
 
 def _resolve_path(path: str) -> str:
     """
@@ -142,6 +150,30 @@ def _format_block(block, table_level: int = 0) -> List[str]:
             
     return output
 
+def _normalize_font(value: Optional[str], fallback: str) -> str:
+    if value is None:
+        return fallback
+    value = str(value).strip()
+    return value or fallback
+
+def _apply_run_fonts(run, font_cn: Optional[str], font_en: Optional[str]) -> None:
+    font_cn = _normalize_font(font_cn, DEFAULT_FONT_CN)
+    font_en = _normalize_font(font_en, DEFAULT_FONT_EN)
+
+    if font_en:
+        run.font.name = font_en
+
+    if font_cn or font_en:
+        rpr = run._element.get_or_add_rPr()
+        rfonts = rpr.rFonts
+        if rfonts is None:
+            rfonts = rpr._add_rFonts()
+        if font_en:
+            rfonts.set(qn("w:ascii"), font_en)
+            rfonts.set(qn("w:hAnsi"), font_en)
+        if font_cn:
+            rfonts.set(qn("w:eastAsia"), font_cn)
+
 @mcp.tool()
 def read_docx(path: str) -> str:
     """
@@ -195,7 +227,9 @@ def read_docx_advanced(path: str, include_headers: bool = False, include_footers
         return f"Error reading docx: {str(e)}"
 
 @mcp.tool()
-def create_new_docx(path: str, title: Optional[str] = None, author: Optional[str] = None) -> str:
+def create_new_docx(path: str, title: Optional[str] = None, author: Optional[str] = None,
+                    title_bold: bool = False, font_cn: str = DEFAULT_FONT_CN,
+                    font_en: str = DEFAULT_FONT_EN) -> str:
     """
     Create a new empty Word document.
     'path' is the container path (e.g. /workspace/new.docx).
@@ -208,7 +242,10 @@ def create_new_docx(path: str, title: Optional[str] = None, author: Optional[str
         doc = DocumentFunction()
         if title:
             doc.core_properties.title = title
-            doc.add_heading(title, 0)
+            h = doc.add_heading(title, 0)
+            for run in h.runs:
+                run.bold = bool(title_bold)
+                _apply_run_fonts(run, font_cn=font_cn, font_en=font_en)
         if author:
             doc.core_properties.author = author
             
@@ -218,7 +255,9 @@ def create_new_docx(path: str, title: Optional[str] = None, author: Optional[str
         return f"Error creating docx: {str(e)}"
 
 @mcp.tool()
-def add_heading(path: str, text: str, level: int = 1, align: str = "left") -> str:
+def add_heading(path: str, text: str, level: int = 1, align: str = "left",
+                bold: bool = False, font_cn: str = DEFAULT_FONT_CN,
+                font_en: str = DEFAULT_FONT_EN) -> str:
     """
     Add a heading to the document.
     'level' 0-9. 'align' can be left, center, right.
@@ -230,6 +269,9 @@ def add_heading(path: str, text: str, level: int = 1, align: str = "left") -> st
     try:
         doc = DocumentFunction(resolved_path)
         h = doc.add_heading(text, level=level)
+        for run in h.runs:
+            run.bold = bool(bold)
+            _apply_run_fonts(run, font_cn=font_cn, font_en=font_en)
         
         if align.lower() == "center":
             h.alignment = WD_ALIGN_PARAGRAPH.CENTER
@@ -242,9 +284,10 @@ def add_heading(path: str, text: str, level: int = 1, align: str = "left") -> st
         return f"Error adding heading: {str(e)}"
 
 @mcp.tool()
-def add_paragraph(path: str, text: str, bold: bool = False, italic: bool = False, 
-                  color: Optional[str] = None, size: Optional[int] = None, 
-                  align: str = "left") -> str:
+def add_paragraph(path: str, text: str, bold: bool = False, italic: bool = False,
+                  color: Optional[str] = None, size: Optional[int] = None,
+                  align: str = "left", font_cn: str = DEFAULT_FONT_CN,
+                  font_en: str = DEFAULT_FONT_EN) -> str:
     """
     Add a styled paragraph to the document.
     'color' is hex RRGGBB. 'size' is in points.
@@ -258,12 +301,13 @@ def add_paragraph(path: str, text: str, bold: bool = False, italic: bool = False
         p = doc.add_paragraph()
         run = p.add_run(text)
         
-        if bold: run.bold = True
-        if italic: run.italic = True
+        run.bold = bool(bold)
+        run.italic = bool(italic)
         if color:
             run.font.color.rgb = RGBColor.from_string(color)
         if size:
             run.font.size = Pt(size)
+        _apply_run_fonts(run, font_cn=font_cn, font_en=font_en)
             
         if align.lower() == "center":
             p.alignment = WD_ALIGN_PARAGRAPH.CENTER
@@ -276,7 +320,9 @@ def add_paragraph(path: str, text: str, bold: bool = False, italic: bool = False
         return f"Error adding paragraph: {str(e)}"
 
 @mcp.tool()
-def add_list_item(path: str, text: str, style: str = "bulleted") -> str:
+def add_list_item(path: str, text: str, style: str = "bulleted",
+                  bold: bool = False, font_cn: str = DEFAULT_FONT_CN,
+                  font_en: str = DEFAULT_FONT_EN) -> str:
     """
     Add a list item (bulleted or numbered).
     'style' can be 'bulleted' or 'numbered'.
@@ -288,7 +334,10 @@ def add_list_item(path: str, text: str, style: str = "bulleted") -> str:
     try:
         doc = DocumentFunction(resolved_path)
         list_style = 'List Bullet' if style.lower() == "bulleted" else 'List Number'
-        doc.add_paragraph(text, style=list_style)
+        p = doc.add_paragraph(text, style=list_style)
+        for run in p.runs:
+            run.bold = bool(bold)
+            _apply_run_fonts(run, font_cn=font_cn, font_en=font_en)
         doc.save(resolved_path)
         return f"Added {style} list item to {path}"
     except Exception as e:
@@ -325,8 +374,9 @@ def get_document_info(path: str) -> str:
         return f"Error getting document info: {str(e)}"
 
 @mcp.tool()
-def insert_content_relative(path: str, target_text: str, content: str, position: str = "after", 
-                             element_type: str = "paragraph") -> str:
+def insert_content_relative(path: str, target_text: str, content: str, position: str = "after",
+                             element_type: str = "paragraph", bold: bool = False,
+                             font_cn: str = DEFAULT_FONT_CN, font_en: str = DEFAULT_FONT_EN) -> str:
     """
     Insert content relative to existing text.
     'position' can be 'before' or 'after'.
@@ -355,6 +405,10 @@ def insert_content_relative(path: str, target_text: str, content: str, position:
             new_p = doc.add_heading(content, level=1)
         else:
             new_p = doc.add_paragraph(content)
+
+        for run in new_p.runs:
+            run.bold = bool(bold)
+            _apply_run_fonts(run, font_cn=font_cn, font_en=font_en)
             
         # Move it to the right place in the XML
         p_element = new_p._element
@@ -454,7 +508,9 @@ def replace_text_global(path: str, search_text: str, replace_text: str, include_
         return f"Error in global replace: {str(e)}"
 
 @mcp.tool()
-def insert_table(path: str, rows: int, cols: int, data: Optional[List[List[str]]] = None, style: str = "Table Grid") -> str:
+def insert_table(path: str, rows: int, cols: int, data: Optional[List[List[str]]] = None,
+                 style: str = "Table Grid", bold: bool = False,
+                 font_cn: str = DEFAULT_FONT_CN, font_en: str = DEFAULT_FONT_EN) -> str:
     """
     Insert a table into the document.
     'data' is an optional 2D list of strings.
@@ -474,6 +530,13 @@ def insert_table(path: str, rows: int, cols: int, data: Optional[List[List[str]]
                     for c_idx, cell_value in enumerate(row_data):
                         if c_idx < cols:
                             table.cell(r_idx, c_idx).text = str(cell_value)
+
+        for row in table.rows:
+            for cell in row.cells:
+                for p in cell.paragraphs:
+                    for run in p.runs:
+                        run.bold = bool(bold)
+                        _apply_run_fonts(run, font_cn=font_cn, font_en=font_en)
                             
         doc.save(resolved_path)
         return f"Inserted {rows}x{cols} table into {path}"
@@ -481,9 +544,10 @@ def insert_table(path: str, rows: int, cols: int, data: Optional[List[List[str]]
         return f"Error inserting table: {str(e)}"
 
 @mcp.tool()
-def set_table_cell_format(path: str, table_index: int, row: int, col: int, 
-                          bg_color: Optional[str] = None, bold: bool = False, 
-                          align: Optional[str] = None) -> str:
+def set_table_cell_format(path: str, table_index: int, row: int, col: int,
+                          bg_color: Optional[str] = None, bold: bool = False,
+                          align: Optional[str] = None, font_cn: str = DEFAULT_FONT_CN,
+                          font_en: str = DEFAULT_FONT_EN) -> str:
     """
     Format a specific cell in a table.
     'bg_color' is hex RRGGBB. 'align' is left, center, right.
@@ -504,16 +568,17 @@ def set_table_cell_format(path: str, table_index: int, row: int, col: int,
             shading_elm = parse_xml(f'<w:shd {nsdecls("w")} w:fill="{bg_color}"/>')
             cell._tc.get_or_add_tcPr().append(shading_elm)
             
-        if bold:
-            for p in cell.paragraphs:
-                for run in p.runs:
-                    run.bold = True
-                    
         if align:
             alignment = {"left": WD_ALIGN_PARAGRAPH.LEFT, "center": WD_ALIGN_PARAGRAPH.CENTER, "right": WD_ALIGN_PARAGRAPH.RIGHT}.get(align.lower())
             if alignment is not None:
                 for p in cell.paragraphs:
                     p.alignment = alignment
+
+        for p in cell.paragraphs:
+            for run in p.runs:
+                if bold:
+                    run.bold = True
+                _apply_run_fonts(run, font_cn=font_cn, font_en=font_en)
                     
         doc.save(resolved_path)
         return f"Formatted cell ({row}, {col}) in table {table_index}"

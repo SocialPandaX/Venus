@@ -20,9 +20,9 @@
       },
       "tools_timeout": 10
     },
-    "docx_editor": {
-      "command": "python",
-      "args": ["tools/docx_editor.py"]
+    "office_word": {
+      "command": "uvx",
+      "args": ["--from", "office-word-mcp-server", "word_mcp_server"]
     },
     "sequential_thinking": {
       "command": "npx",
