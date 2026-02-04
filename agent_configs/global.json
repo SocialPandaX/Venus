@@ -1,0 +1,7 @@
+{
+  "system_prompt": "【全局协作规则】\n1. delegate：同步调用，必须等待对方返回结果后再继续。\n2. notify：异步通知，不等待结果，只做消息触发。\n3. 禁止 delegate 自己。\n4. 禁止 delegate 调用链上的上级/祖先 Agent（例如 A→B→C 时，C 不得再调用 A 或 B）。\n5. 如需向上沟通，请直接返回结果给调用方，由调用方决定后续分派。\n6. skills：系统可能自动注入匹配技能；也可使用 `use_skill` 读取技能内容，必要时设置 include_references=true。",
+  "skills_default": [
+    "collab",
+    "testing"
+  ]
+}

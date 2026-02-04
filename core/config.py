@@ -12,6 +12,7 @@ class AgentConfig:
         self.name = name
         self.config_dir = config_dir
         self.config_data = self._load_config()
+        self.global_data = self._load_global_config()
 
     def _non_empty(self, value: Any) -> str | None:
         if value is None:
@@ -30,6 +31,19 @@ class AgentConfig:
         # Use utf-8-sig to tolerate BOM added by some Windows editors.
         with open(config_path, 'r', encoding='utf-8-sig') as f:
             return json.load(f)
+
+    def _load_global_config(self) -> Dict[str, Any]:
+        global_path = os.path.join(self.config_dir, "global.json")
+        if not os.path.exists(global_path):
+            return {}
+        try:
+            with open(global_path, "r", encoding="utf-8-sig") as f:
+                data = json.load(f)
+            if isinstance(data, dict):
+                return data
+        except Exception:
+            return {}
+        return {}
 
     @property
     def system_prompt(self) -> str:
@@ -58,6 +72,27 @@ class AgentConfig:
     @property
     def mcp_servers(self) -> Dict[str, Any]:
         return self.config_data.get("mcpServers", {})
+
+    @property
+    def skills_default(self) -> list[str]:
+        value = self.global_data.get("skills_default", [])
+        if isinstance(value, list):
+            return [str(v) for v in value]
+        return []
+
+    @property
+    def skills_include(self) -> list[str]:
+        value = self.config_data.get("skills_include", [])
+        if isinstance(value, list):
+            return [str(v) for v in value]
+        return []
+
+    @property
+    def skills_exclude(self) -> list[str]:
+        value = self.config_data.get("skills_exclude", [])
+        if isinstance(value, list):
+            return [str(v) for v in value]
+        return []
 
     @property
     def require_confirmation(self) -> bool:

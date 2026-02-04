@@ -1,28 +1,29 @@
-import asyncio
+﻿import asyncio
 import json
 import os
 import re
-import sys
-import traceback
 import uuid
-from typing import Optional
+from typing import Optional, TYPE_CHECKING
+
+if TYPE_CHECKING:
+    from agent.runtime import AgentRuntime
 
 from openai import OpenAI
 from core.mcp_client import MultiServerMCPClient
 from core.config import AgentConfig
-
-class AgentHandoff(Exception):
-    """Signal to switch control to another agent."""
-    def __init__(self, target_agent: str, message: str, container: Optional[str] = None):
-        self.target_agent = target_agent
-        self.message = message
-        self.container = container
+from core.skill_registry import SkillRegistry
 
 class BaseAgent:
-    def __init__(self, agent_name: str, extra_env: Optional[dict] = None):
+    def __init__(
+        self,
+        agent_name: str,
+        extra_env: Optional[dict] = None,
+        runtime: Optional["AgentRuntime"] = None,
+    ):
         self.name = agent_name
         self.config = AgentConfig(agent_name)
         self.extra_env = extra_env or {}
+        self.runtime = runtime
         self.client_ai = OpenAI(
             api_key=self.config.api_key,
             base_url=self.config.api_base_url
@@ -32,6 +33,14 @@ class BaseAgent:
         self.confirmed = False
         # Create MCP client with server config directly from agent config
         self.mcp_client = MultiServerMCPClient({"mcpServers": self.config.mcp_servers}, extra_env=self.extra_env)
+        self._session_started = False
+        self._messages: list[dict] | None = None
+        self._openai_tools_all: list[dict] | None = None
+        self._current_call_chain: list[str] | None = None
+        self._skill_registry: Optional[SkillRegistry] = None
+        self._skills_enabled: list[str] = []
+        self._skills_prompt: str = ""
+        self._skills_loaded: set[str] = set()
 
     def _get_mcp_prompts(self) -> str:
         """
@@ -68,61 +77,191 @@ class BaseAgent:
         header = "\n\n" + "="*30 + "\n你已加载以下 MCP 工具服务器，请严格遵循其特定的指令和参数规范：\n"
         return header + "\n\n".join(prompts) + "\n" + "="*30
 
+    def _get_global_prompt(self) -> str:
+        config_dir = getattr(self.config, "config_dir", "agent_configs")
+        path = os.path.join(config_dir, "global.json")
+        if not os.path.exists(path):
+            return ""
+        try:
+            with open(path, "r", encoding="utf-8-sig") as f:
+                data = json.load(f)
+            prompt = data.get("system_prompt") or data.get("prompt") or ""
+            prompt = str(prompt).strip()
+            if not prompt:
+                return ""
+            return "\n\n" + prompt
+        except Exception:
+            return ""
+
+    def _init_skills(self) -> None:
+        project_root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+        project_skills = os.path.join(project_root, "skills")
+        codex_home = os.getenv("CODEX_HOME", os.path.expanduser("~/.codex"))
+        global_skills = os.path.join(codex_home, "skills")
+        registry = SkillRegistry([project_skills, global_skills])
+        available = registry.list_skills()
+        if not available:
+            self._skill_registry = registry
+            self._skills_enabled = []
+            self._skills_prompt = ""
+            self._skills_loaded = set()
+            return
+
+        defaults = self.config.skills_default
+        include = self.config.skills_include
+        exclude = self.config.skills_exclude
+
+        enabled = SkillRegistry.resolve_enabled(available, defaults, include, exclude)
+
+        self._skill_registry = registry
+        self._skills_enabled = enabled
+        self._skills_prompt = registry.build_skills_prompt(enabled)
+        self._skills_loaded = set()
+
+    def _auto_attach_skills(self, user_input: str, messages: list[dict]) -> None:
+        if not self._skill_registry or not self._skills_enabled:
+            return
+        if not user_input:
+            return
+        matches = self._skill_registry.match_skills(user_input, self._skills_enabled, max_matches=2)
+        for name in matches:
+            if name in self._skills_loaded:
+                continue
+            content = self._skill_registry.read_skill(name, include_references=False)
+            messages.append({
+                "role": "system",
+                "content": f"[Auto Skill: {name}]\n{content}"
+            })
+            self._skills_loaded.add(name)
+
     def _construct_system_prompt(self) -> str:
-        """构建最终的系统提示词，包含 Agent 基础提示词和 MCP 动态提示词。"""
+        """Build final system prompt with global and MCP-specific rules."""
         base_prompt = self.config.system_prompt
+        global_prompt = self._get_global_prompt()
         mcp_prompts = self._get_mcp_prompts()
-        return base_prompt + mcp_prompts
+        return base_prompt + global_prompt + self._skills_prompt + mcp_prompts
+
+    def _discover_agent_names(self) -> list[str]:
+        config_dir = getattr(self.config, "config_dir", "agent_configs")
+        if not os.path.isdir(config_dir):
+            return []
+        names = []
+        for entry in os.listdir(config_dir):
+            if not entry.endswith(".json"):
+                continue
+            if entry == "groups.json":
+                continue
+            names.append(os.path.splitext(entry)[0])
+        return sorted(dict.fromkeys(names))
+
+    def _known_agent_names(self) -> list[str]:
+        if self.runtime:
+            names = self.runtime.list_agents()
+            if names:
+                return names
+        names = self._discover_agent_names()
+        if names:
+            return names
+        return ["manager", "developer", "clerk"]
 
     def _local_tools(self) -> list[dict]:
+        agent_names = self._known_agent_names()
         return [
             {
                 "type": "function",
                 "function": {
-                    "name": "delegate",
-                    "description": "Delegate a task to another agent and wait for its completion. Use this when you need a sub-task done but intend to resume control afterwards.",
+                    "name": "use_skill",
+                    "description": "Load a skill's instructions by name.",
                     "parameters": {
                         "type": "object",
                         "properties": {
-                            "to_agent": {
-                                "type": "string",
-                            "enum": ["manager", "developer", "clerk"]
-                            },
-                            "message": {"type": "string"},
-                            "container": {
-                                "type": "string",
-                                "description": "Optional container name override for the delegated agent."
-                            }
+                            "name": {"type": "string"},
+                            "include_references": {"type": "boolean"}
                         },
-                        "required": ["to_agent", "message"]
+                        "required": ["name"]
                     }
                 }
             },
             {
                 "type": "function",
                 "function": {
-                    "name": "handoff",
-                    "description": "Transfer control to another agent completely. Use this when your current phase is done and the next agent should take over the interaction with the user.",
+                    "name": "list_skills",
+                    "description": "List available skills and summaries.",
+                    "parameters": {
+                        "type": "object",
+                        "properties": {}
+                    }
+                }
+            },
+            {
+                "type": "function",
+                "function": {
+                    "name": "delegate",
+                    "description": "Delegate a task to another agent and wait for its completion (parallel runtime only).",
                     "parameters": {
                         "type": "object",
                         "properties": {
                             "to_agent": {
                                 "type": "string",
-                            "enum": ["manager", "developer", "clerk"]
+                                "enum": agent_names,
+                            },
+                            "message": {"type": "string"},
+                            "container": {
+                                "type": "string",
+                                "description": "Container override is not supported in parallel mode.",
+                            },
+                        },
+                        "required": ["to_agent", "message"],
+                    },
+                },
+            },
+            {
+                "type": "function",
+                "function": {
+                    "name": "handoff",
+                    "description": "Set the default active agent for console input (parallel runtime only).",
+                    "parameters": {
+                        "type": "object",
+                        "properties": {
+                            "to_agent": {
+                                "type": "string",
+                                "enum": agent_names,
                             },
                             "message": {
                                 "type": "string",
-                                "description": "Context or instructions for the next agent."
+                                "description": "Context or instructions for the next agent.",
                             },
                             "container": {
                                 "type": "string",
-                                "description": "Optional container name override for the next agent."
-                            }
+                                "description": "Container override is not supported in parallel mode.",
+                            },
                         },
-                        "required": ["to_agent", "message"]
-                    }
-                }
-            }
+                        "required": ["to_agent", "message"],
+                    },
+                },
+            },
+            {
+                "type": "function",
+                "function": {
+                    "name": "notify",
+                    "description": "Send a message to another agent without waiting for a response.",
+                    "parameters": {
+                        "type": "object",
+                        "properties": {
+                            "to_agent": {
+                                "type": "string",
+                                "enum": agent_names,
+                            },
+                            "message": {"type": "string"},
+                            "container": {
+                                "type": "string",
+                                "description": "Optional container name override (ignored in parallel mode).",
+                            },
+                        },
+                        "required": ["to_agent", "message"],
+                    },
+                },
+            },
         ]
 
     def _get_tool_output(self, result) -> str:
@@ -191,36 +330,81 @@ class BaseAgent:
         message = args.get("message", "")
         container = args.get("container")
 
-        if to_agent not in {"manager", "developer", "clerk"}:
-            return "Error: invalid to_agent. Must be 'manager', 'developer', or 'clerk'."
+        if to_agent not in set(self._known_agent_names()):
+            return "Error: invalid to_agent."
         if not isinstance(message, str) or not message.strip():
             return "Error: message is required."
 
-        env = dict(self.extra_env)
+        if not self.runtime:
+            return "Error: delegate requires parallel runtime."
         if container:
-            env["MCP_CONTAINER_NAME"] = container
+            return "Error: container override is not supported in parallel mode."
+        if to_agent == self.config.name:
+            return "Error: delegate to self is not allowed."
+        if self._current_call_chain and to_agent in self._current_call_chain:
+            return f"Error: delegate to '{to_agent}' is blocked (ancestor in call chain)."
+        return await self.runtime.call_async(
+            to_agent,
+            message.strip(),
+            from_agent=self.config.name,
+            call_chain=self._current_call_chain,
+        )
 
-        print(f"\n=== Delegate: {self.config.name} -> {to_agent} ===")
-        print(f"Message: {message}\n")
-        
-        target = BaseAgent(to_agent, extra_env=env)
-        result = await target.run_once(message.strip())
-        
-        print(f"\n=== Delegate Finished: {to_agent} -> {self.config.name} ===")
-        print(f"Response: {result}\n")
-        
-        return result or "[Delegate completed with no response]"
+    async def _handle_handoff(self, args: dict) -> Optional[str]:
+        to_agent = args.get("to_agent")
+        _ = args.get("message", "")
+        _ = args.get("container")
 
-    async def _handle_handoff(self, args: dict) -> None:
+        if to_agent not in set(self._known_agent_names()):
+            raise ValueError("Error: invalid to_agent.")
+
+        print(f"\n=== Handoff: {self.config.name} -> {to_agent} ===")
+        if self.runtime:
+            self.runtime.set_active(to_agent)
+            return f"Active agent set to {to_agent}"
+        return "Error: handoff requires parallel runtime."
+
+    async def _handle_notify(self, args: dict) -> str:
         to_agent = args.get("to_agent")
         message = args.get("message", "")
-        container = args.get("container")
-        
-        if to_agent not in {"manager", "developer", "clerk"}:
-            raise ValueError("Error: invalid to_agent. Must be 'manager', 'developer', or 'clerk'.")
-            
-        print(f"\n=== Handoff: {self.config.name} -> {to_agent} ===")
-        raise AgentHandoff(to_agent, message, container)
+        if to_agent not in set(self._known_agent_names()):
+            return "Error: invalid to_agent."
+        if not isinstance(message, str) or not message.strip():
+            return "Error: message is required."
+        if not self.runtime:
+            return "Error: notify is only supported in parallel mode."
+        ok = self.runtime.notify(to_agent, message.strip(), from_agent=self.config.name)
+        if not ok:
+            return f"Error: agent '{to_agent}' not found."
+        return f"Notified {to_agent}."
+
+    async def _handle_use_skill(self, args: dict) -> str:
+        name = args.get("name")
+        include_references = bool(args.get("include_references", False))
+        if not isinstance(name, str) or not name.strip():
+            return "Error: name is required."
+        if not self._skill_registry:
+            return "Error: skills are not available."
+        if name not in self._skills_enabled:
+            return f"Error: skill '{name}' is not enabled."
+        content = self._skill_registry.read_skill(name, include_references=include_references)
+        if not content.startswith("Error:"):
+            self._skills_loaded.add(name)
+        return content
+
+    async def _handle_list_skills(self) -> str:
+        if not self._skill_registry:
+            return "No skills available."
+        if not self._skills_enabled:
+            return "No skills enabled."
+        summaries = []
+        for name in self._skills_enabled:
+            summary = self._skill_registry.get_summary(name) or ""
+            if summary:
+                summaries.append(f"- {name}: {summary}")
+            else:
+                summaries.append(f"- {name}")
+        return "\n".join(summaries)
 
     def _check_confirmation(self, text: str) -> bool:
         if not self.confirmation_keywords:
@@ -497,376 +681,223 @@ class BaseAgent:
         
         return None
 
-    async def run_once(self, user_input: str) -> str:
-        """Run a single user input to completion (tools + final response), then exit."""
-        try:
-            await self.mcp_client.connect()
-            
-            openai_tools_all = await self.mcp_client.get_openai_tools()
-            local_tools = self._local_tools()
-            openai_tools_all.extend(local_tools)
+    async def start_session(self) -> None:
+        if self._session_started:
+            return
 
-            if not openai_tools_all:
-                print("No tools loaded. Exiting.")
-                return ""
-            
-            messages = [
-                {"role": "system", "content": self._construct_system_prompt()},
-                {"role": "user", "content": user_input},
-            ]
+        await self.mcp_client.connect()
+        self._init_skills()
+        openai_tools_all = await self.mcp_client.get_openai_tools()
+        local_tools = self._local_tools()
+        openai_tools_all.extend(local_tools)
 
-            print(f"\n=== Agent '{self.config.name}' Started ===")
-            print("Model:", self.config.model_name)
-            print("Available tools:", ", ".join(self.mcp_client.tools_map.keys()))
+        if not openai_tools_all:
+            print("No tools loaded. Exiting.")
+            raise RuntimeError("No tools loaded")
 
-            if self.require_confirmation and self._check_confirmation(user_input):
+        self._openai_tools_all = openai_tools_all
+        self._messages = [{"role": "system", "content": self._construct_system_prompt()}]
+        self._session_started = True
+
+        print(f"\n=== Agent '{self.config.name}' Started ===")
+        print("Model:", self.config.model_name)
+        print("Available tools:", ", ".join(self.mcp_client.tools_map.keys()))
+
+    async def shutdown(self) -> None:
+        await self.mcp_client.cleanup()
+        self._session_started = False
+        self._messages = None
+        self._openai_tools_all = None
+
+    async def process_user_message(self, user_input: str) -> str:
+        if not self._session_started:
+            await self.start_session()
+        if not user_input or not user_input.strip():
+            return ""
+
+        if self.require_confirmation and not self.confirmed:
+            if self._check_confirmation(user_input):
                 self.confirmed = True
 
-            while True:
-                tools_for_turn = openai_tools_all
-                if self.require_confirmation and not self.confirmed:
-                    safe_tools = {"sequentialthinking", "container_status", "read_file", "list_directory"}
-                    tools_for_turn = [
-                        t for t in openai_tools_all
-                        if t["function"]["name"] in safe_tools
-                    ]
-                
-                response = await self._safe_chat_completion(messages, tools=tools_for_turn)
-                response_message = response.choices[0].message
-                
-                if not response_message.tool_calls:
-                    tool_json = self._extract_tool_call(response_message.content or "")
-                    normalized = self._normalize_tool_call(tool_json) if tool_json else None
-                    if normalized:
-                        function_name, function_args = normalized
-                        safe_tools = {"sequentialthinking", "container_status", "read_file", "list_directory"}
-                        if self.require_confirmation and not self.confirmed and function_name not in safe_tools:
-                            self._print_agent_response(response_message.content)
-                            messages.append(response_message)
-                            return response_message.content or ""
-                        # Allow only known tools
+        messages = self._messages if self._messages is not None else []
+        openai_tools_all = self._openai_tools_all or []
+        self._auto_attach_skills(user_input, messages)
+        messages.append({"role": "user", "content": user_input})
+
+        while True:
+            tools_for_turn = openai_tools_all
+            if self.require_confirmation and not self.confirmed:
+                safe_tools = {"sequentialthinking", "container_status", "read_file", "list_directory", "use_skill", "list_skills"}
+                tools_for_turn = [
+                    t for t in openai_tools_all
+                    if t["function"]["name"] in safe_tools
+                ]
+
+            response = await self._safe_chat_completion(messages, tools=tools_for_turn)
+            response_message = response.choices[0].message
+
+            if not response_message.tool_calls:
+                tool_json = self._extract_tool_call(response_message.content or "")
+                normalized = self._normalize_tool_call(tool_json) if tool_json else None
+                if normalized:
+                    function_name, function_args = normalized
+                    safe_tools = {"sequentialthinking", "container_status", "read_file", "list_directory", "use_skill", "list_skills"}
+                    allowed_tools = set()
+                    if (not self.require_confirmation or self.confirmed or function_name in safe_tools):
                         allowed_tools = set(self.mcp_client.tools_map.keys())
                         if not self.require_confirmation or self.confirmed:
-                            if "delegate" in {t["function"]["name"] for t in self._local_tools()}:
-                                allowed_tools.add("delegate")
-                                allowed_tools.add("handoff")
-                        
-                        if function_name in allowed_tools:
-                            # Synthesize a tool call
-                            tool_call_id = f"manual_{uuid.uuid4().hex}"
+                            local_tool_names = {t["function"]["name"] for t in self._local_tools()}
+                            allowed_tools.update(local_tool_names)
+
+                    if function_name in allowed_tools:
+                        self._print_agent_response(response_message.content)
+                        messages.append({"role": "assistant", "content": response_message.content})
+
+                        tool_call_id = f"manual_{uuid.uuid4().hex}"
+                        messages.append({
+                            "role": "assistant",
+                            "tool_calls": [{
+                                "id": tool_call_id,
+                                "type": "function",
+                                "function": {
+                                    "name": function_name,
+                                    "arguments": json.dumps(function_args, ensure_ascii=False)
+                                }
+                            }]
+                        })
+                        print(f"\n[{self.config.name}] Tool Calls Detected (manual)")
+                        print(f"[{self.config.name}] Calling: {function_name}")
+                        if function_name == "execute_command" and isinstance(function_args, dict):
+                            self._log_execute_command(function_args)
+                        try:
+                            if function_name == "delegate":
+                                tool_output = await self._handle_delegate(function_args)
+                            elif function_name == "handoff":
+                                tool_output = await self._handle_handoff(function_args)
+                                if tool_output is None:
+                                    return ""
+                            elif function_name == "notify":
+                                tool_output = await self._handle_notify(function_args)
+                            elif function_name == "use_skill":
+                                tool_output = await self._handle_use_skill(function_args)
+                            elif function_name == "list_skills":
+                                tool_output = await self._handle_list_skills()
+                            else:
+                                result = await self.mcp_client.call_tool(function_name, function_args)
+                                tool_output = self._get_tool_output(result)
+
+                            display_output = (tool_output[:200] + '...') if len(tool_output) > 200 else tool_output
+                            print(f"[Result] {display_output}")
                             messages.append({
-                                "role": "assistant",
-                                "tool_calls": [{
-                                    "id": tool_call_id,
-                                    "type": "function",
-                                    "function": {
-                                        "name": function_name,
-                                        "arguments": json.dumps(function_args, ensure_ascii=False)
-                                    }
-                                }]
+                                "role": "tool",
+                                "tool_call_id": tool_call_id,
+                                "content": tool_output
                             })
-                            print(f"\n[{self.config.name}] Tool Calls Detected (manual)")
-                            print(f"[{self.config.name}] Calling: {function_name}")
-                            if function_name == "execute_command" and isinstance(function_args, dict):
-                                self._log_execute_command(function_args)
-
-                            try:
-                                if function_name == "delegate":
-                                    tool_output = await self._handle_delegate(function_args)
-                                elif function_name == "handoff":
-                                    await self._handle_handoff(function_args)
-                                    return None # Should not reach here
-                                else:
-                                    result = await self.mcp_client.call_tool(function_name, function_args)
-                                    tool_output = self._get_tool_output(result)
-                                
-                                display_output = (tool_output[:200] + '...') if len(tool_output) > 200 else tool_output
-                                print(f"[Result] {display_output}")
-                                messages.append({
-                                    "role": "tool",
-                                    "tool_call_id": tool_call_id,
-                                    "content": tool_output
-                                })
-                                continue
-                            except Exception as e:
-                                err_msg = self._format_tool_error(e)
-                                print(f"[Error] {err_msg}")
-                                messages.append({
-                                    "role": "tool",
-                                    "tool_call_id": tool_call_id,
-                                    "content": f"Error: {err_msg}"
-                                })
-                                continue
-
-                    self._print_agent_response(response_message.content)
-                    messages.append(response_message)
-                    return response_message.content or ""
-
-                messages.append(response_message)
-                print(f"\n[{self.config.name}] Tool Calls Detected")
-                
-                for tool_call in response_message.tool_calls:
-                    function_name = tool_call.function.name
-                    function_args = json.loads(self._repair_json(tool_call.function.arguments))
-                    
-                    print(f"[{self.config.name}] Calling: {function_name}")
-                    if function_name == "execute_command" and isinstance(function_args, dict):
-                        self._log_execute_command(function_args)
-                    
-                    try:
-                        if function_name == "delegate":
-                            tool_output = await self._handle_delegate(function_args)
-                        elif function_name == "handoff":
-                            await self._handle_handoff(function_args)
-                            return None # Should not reach here
-                        else:
-                            result = await self.mcp_client.call_tool(function_name, function_args)
-                            tool_output = self._get_tool_output(result)
-                        
-                        display_output = (tool_output[:200] + '...') if len(tool_output) > 200 else tool_output
-                        print(f"[Result] {display_output}")
-
-                        messages.append({
-                            "role": "tool",
-                            "tool_call_id": tool_call.id,
-                            "content": tool_output
-                        })
-                        
-                    except Exception as e:
-                        err_msg = self._format_tool_error(e)
-                        print(f"[Error] {err_msg}")
-                        messages.append({
-                            "role": "tool",
-                            "tool_call_id": tool_call.id,
-                            "content": f"Error: {err_msg}"
-                        })
-        finally:
-            await self.mcp_client.cleanup()
-            print(f"\n[{self.name}] Connections closed.")
-
-    async def run(self, initial_message: Optional[str] = None) -> Optional[AgentHandoff]:
-        try:
-            await self.mcp_client.connect()
-            
-            openai_tools_all = await self.mcp_client.get_openai_tools()
-            local_tools = self._local_tools()
-            openai_tools_all.extend(local_tools)
-
-            if not openai_tools_all:
-                print("No tools loaded. Exiting.")
-                return
-            
-            messages = [
-                {"role": "system", "content": self._construct_system_prompt()}
-            ]
-
-            if initial_message:
-                print(f"\n[System] Incoming handoff message: {initial_message}")
-                # messages.append({"role": "user", "content": f"[Handoff Message] {initial_message}"})
-                # Note: We rely on the loop below to add this as the first user message.
-
-            print(f"\n=== Agent '{self.config.name}' Started ===")
-            print("Model:", self.config.model_name)
-            print("Available tools:", ", ".join(self.mcp_client.tools_map.keys()))
-            print("Type 'quit' or 'exit' to stop.")
-            
-            pending_input = initial_message
-            while True:
-                try:
-                    if pending_input:
-                        user_input = pending_input
-                        pending_input = None
-                        print(f"\nUser (from handoff): {user_input}")
+                            continue
+                        except Exception as e:
+                            err_msg = self._format_tool_error(e)
+                            print(f"[Error] {err_msg}")
+                            messages.append({
+                                "role": "tool",
+                                "tool_call_id": tool_call_id,
+                                "content": f"Error: {err_msg}"
+                            })
+                            continue
                     else:
-                        prompt = "\nUser: "
-                        if self.require_confirmation and not self.confirmed:
-                            prompt = "\nUser: "
-                        user_input = input(prompt)
-                    
-                    if user_input.lower() in ['quit', 'exit']:
-                        break
-                    if not user_input.strip():
-                        continue
+                        print(f"[{self.config.name}] Warning: Tool '{function_name}' is not recognized or not allowed in current state.")
 
-                    if self.require_confirmation and not self.confirmed:
-                        if self._check_confirmation(user_input):
-                            self.confirmed = True
+                self._print_agent_response(response_message.content)
+                messages.append(response_message)
+                return response_message.content or ""
 
-                    messages.append({"role": "user", "content": user_input})
+            if response_message.content:
+                self._print_agent_response(response_message.content)
 
-                    # Process interaction loop
-                    while True:
-                        tools_for_turn = openai_tools_all
-                        if self.require_confirmation and not self.confirmed:
-                            # Allow safe tools (thought, status check) even without confirmation
-                            safe_tools = {"sequentialthinking", "container_status", "read_file", "list_directory"}
-                            tools_for_turn = [
-                                t for t in openai_tools_all 
-                                if t["function"]["name"] in safe_tools
-                            ]
-                        
-                        response = await self._safe_chat_completion(messages, tools=tools_for_turn)
-                        response_message = response.choices[0].message
-                        
-                        # If no tool calls, attempt to recover from tool-call JSON
-                        if not response_message.tool_calls:
-                            tool_json = self._extract_tool_call(response_message.content or "")
-                            normalized = self._normalize_tool_call(tool_json) if tool_json else None
-                            if normalized:
-                                function_name, function_args = normalized
-                                safe_tools = {"sequentialthinking", "container_status", "read_file", "list_directory"}
-                                allowed_tools = set()
-                                if (not self.require_confirmation or self.confirmed or function_name in safe_tools):
-                                    allowed_tools = set(self.mcp_client.tools_map.keys())
-                                    if not self.require_confirmation or self.confirmed:
-                                        if "delegate" in {t["function"]["name"] for t in self._local_tools()}:
-                                            allowed_tools.add("delegate")
-                                            allowed_tools.add("handoff")
-                                
-                                if function_name in allowed_tools:
-                                    # Handle mixed content: print text content first if exists
-                                    # Since we extracted a tool call from content, the content itself IS the tool call usually.
-                                    # But sometimes it might be "Here is the code:\n```json...```".
-                                    # We should check if there is meaningful text before the tool call block.
-                                    # For simplicity, if we found a manual tool call, we assume the user might want to see the whole message if it's mixed.
-                                    # However, standard behavior for tool use is usually to hide the raw JSON.
-                                    # Let's try to split: Text Message -> Tool Call
-                                    
-                                    # 1. Add the original message as a text assistant message
-                                    # If the content is purely the JSON block, we might skip this, but printing it is safer for context.
-                                    self._print_agent_response(response_message.content)
-                                    messages.append({"role": "assistant", "content": response_message.content})
+            messages.append(response_message)
+            print(f"\n[{self.config.name}] Tool Calls Detected")
 
-                                    # 2. Add the synthesized tool call
-                                    tool_call_id = f"manual_{uuid.uuid4().hex}"
-                                    messages.append({
-                                        "role": "assistant",
-                                        "tool_calls": [{
-                                            "id": tool_call_id,
-                                            "type": "function",
-                                            "function": {
-                                                "name": function_name,
-                                                "arguments": json.dumps(function_args, ensure_ascii=False)
-                                            }
-                                        }]
-                                    })
-                                    print(f"\n[{self.config.name}] Tool Calls Detected (manual)")
-                                    print(f"[{self.config.name}] Calling: {function_name}")
-                                    if function_name == "execute_command" and isinstance(function_args, dict):
-                                        self._log_execute_command(function_args)
-                                    try:
-                                        if function_name == "delegate":
-                                            tool_output = await self._handle_delegate(function_args)
-                                        elif function_name == "handoff":
-                                            await self._handle_handoff(function_args)
-                                            return None # Should not reach here
-                                        else:
-                                            result = await self.mcp_client.call_tool(function_name, function_args)
-                                            tool_output = self._get_tool_output(result)
-                                        
-                                        display_output = (tool_output[:200] + '...') if len(tool_output) > 200 else tool_output
-                                        print(f"[Result] {display_output}")
-                                        messages.append({
-                                            "role": "tool",
-                                            "tool_call_id": tool_call_id,
-                                            "content": tool_output
-                                        })
-                                        continue
-                                    except AgentHandoff:
-                                        raise
-                                    except Exception as e:
-                                        err_msg = self._format_tool_error(e)
-                                        print(f"[Error] {err_msg}")
-                                        messages.append({
-                                            "role": "tool",
-                                            "tool_call_id": tool_call_id,
-                                            "content": f"Error: {err_msg}"
-                                        })
-                                        continue
-                                else:
-                                    print(f"[{self.config.name}] Warning: Tool '{function_name}' is not recognized or not allowed in current state.")
+            for tool_call in response_message.tool_calls:
+                function_name = tool_call.function.name
+                try:
+                    function_args = json.loads(self._repair_json(tool_call.function.arguments))
+                except json.JSONDecodeError as e:
+                    print(f"[{self.config.name}] Error decoding JSON arguments for {function_name}: {e}")
+                    print(f"Raw arguments: {tool_call.function.arguments}")
+                    messages.append({
+                        "role": "tool",
+                        "tool_call_id": tool_call.id,
+                        "content": f"Error: Invalid JSON arguments provided. Please ensure arguments are valid JSON. Error: {str(e)}"
+                    })
+                    continue
 
-                            self._print_agent_response(response_message.content)
-                            messages.append(response_message)
-                            break
+                print(f"[{self.config.name}] Calling: {function_name}")
+                if function_name == "execute_command" and isinstance(function_args, dict):
+                    self._log_execute_command(function_args)
 
-                        # Handle tool calls
-                        # If there is content AND tool calls (native), print content first
-                        if response_message.content:
-                            self._print_agent_response(response_message.content)
-                        
-                        messages.append(response_message)
-                        print(f"\n[{self.config.name}] Tool Calls Detected")
-                        
-                        for tool_call in response_message.tool_calls:
-                            function_name = tool_call.function.name
-                            try:
-                                function_args = json.loads(self._repair_json(tool_call.function.arguments))
-                            except json.JSONDecodeError as e:
-                                print(f"[{self.config.name}] Error decoding JSON arguments for {function_name}: {e}")
-                                print(f"Raw arguments: {tool_call.function.arguments}")
-                                messages.append({
-                                    "role": "tool",
-                                    "tool_call_id": tool_call.id,
-                                    "content": f"Error: Invalid JSON arguments provided. Please ensure arguments are valid JSON. Error: {str(e)}"
-                                })
-                                continue
-                            
-                            print(f"[{self.config.name}] Calling: {function_name}")
-                            if function_name == "execute_command" and isinstance(function_args, dict):
-                                self._log_execute_command(function_args)
-                            
-                            try:
-                                # Execute local tool or MCP tool
-                                if function_name == "delegate":
-                                    tool_output = await self._handle_delegate(function_args)
-                                elif function_name == "handoff":
-                                    await self._handle_handoff(function_args)
-                                    return None # Should not reach here
-                                else:
-                                    result = await self.mcp_client.call_tool(function_name, function_args)
-                                    tool_output = self._get_tool_output(result)
-                                    
-                                # Truncate for display
-                                display_output = (tool_output[:200] + '...') if len(tool_output) > 200 else tool_output
-                                print(f"[Result] {display_output}")
+                try:
+                    if function_name == "delegate":
+                        tool_output = await self._handle_delegate(function_args)
+                    elif function_name == "handoff":
+                        tool_output = await self._handle_handoff(function_args)
+                        if tool_output is None:
+                            return ""
+                    elif function_name == "notify":
+                        tool_output = await self._handle_notify(function_args)
+                    elif function_name == "use_skill":
+                        tool_output = await self._handle_use_skill(function_args)
+                    elif function_name == "list_skills":
+                        tool_output = await self._handle_list_skills()
+                    else:
+                        result = await self.mcp_client.call_tool(function_name, function_args)
+                        tool_output = self._get_tool_output(result)
 
-                                messages.append({
-                                    "role": "tool",
-                                    "tool_call_id": tool_call.id,
-                                    "content": tool_output
-                                })
-                                
-                            except AgentHandoff:
-                                raise
-                            except Exception as e:
-                                err_msg = self._format_tool_error(e)
-                                print(f"[Error] {err_msg}")
-                                messages.append({
-                                    "role": "tool",
-                                    "tool_call_id": tool_call.id,
-                                    "content": f"Error: {err_msg}"
-                                })
-                        
-                        # Loop continues to send tool outputs back to LLM
-                            
-                except AgentHandoff as handoff:
-                    # Log gracefully without error trace
-                    print(f"\n[System] Handoff signal received: -> {handoff.target_agent}")
-                    return handoff
-                except KeyboardInterrupt:
-                    break
+                    display_output = (tool_output[:200] + '...') if len(tool_output) > 200 else tool_output
+                    print(f"[Result] {display_output}")
+
+                    messages.append({
+                        "role": "tool",
+                        "tool_call_id": tool_call.id,
+                        "content": tool_output
+                    })
+
                 except Exception as e:
-                    print(f"\nAn error occurred: {e}")
-                    traceback.print_exc()
+                    err_msg = self._format_tool_error(e)
+                    print(f"[Error] {err_msg}")
+                    messages.append({
+                        "role": "tool",
+                        "tool_call_id": tool_call.id,
+                        "content": f"Error: {err_msg}"
+                    })
 
+    async def run_queue(self, input_queue, stop_event=None) -> None:
+        try:
+            await self.start_session()
+            while True:
+                if stop_event is not None and stop_event.is_set():
+                    break
+                message = await asyncio.get_running_loop().run_in_executor(None, input_queue.get)
+                if message is None:
+                    continue
+                kind = getattr(message, "kind", "user")
+                if kind == "shutdown":
+                    break
+
+                content = getattr(message, "content", "")
+
+                try:
+                    if kind == "call":
+                        self._current_call_chain = getattr(message, "call_chain", None)
+                    else:
+                        self._current_call_chain = None
+                    result = await self.process_user_message(content)
+                    if kind == "call" and self.runtime:
+                        self.runtime.complete_call(getattr(message, "call_id", None), result or "")
+                except Exception as e:
+                    if kind == "call" and self.runtime:
+                        self.runtime.complete_call(getattr(message, "call_id", None), f"Error: {e}")
+                finally:
+                    self._current_call_chain = None
         finally:
-            await self.mcp_client.cleanup()
+            await self.shutdown()
             print(f"\n[{self.name}] Connections closed.")
 
-if __name__ == "__main__":
-    if sys.platform == 'win32':
-        asyncio.set_event_loop_policy(asyncio.WindowsSelectorEventLoopPolicy())
-    
-    agent = BaseAgent("developer")
-    asyncio.run(agent.run())

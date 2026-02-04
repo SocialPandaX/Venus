@@ -1,0 +1,11 @@
+{
+  "default": [
+    "manager",
+    "developer",
+    "clerk"
+  ],
+  "duo": [
+    "alpha",
+    "beta"
+  ]
+}
